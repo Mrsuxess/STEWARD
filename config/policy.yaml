@@ -1,0 +1,16 @@
+# Deterministic Payment Policy Configuration (STEWARD)
+# AI models cannot read, modify, or override this file.
+per_invoice_cap_usd: 500
+daily_cap_usd: 1500
+auto_approve_below_usd: 200
+
+allowed_payout_assets:
+  - USDC
+
+new_vendor: require_human
+
+address_change:
+  cooling_off_hours: 48
+  require_human: true
+
+kill_switch: false

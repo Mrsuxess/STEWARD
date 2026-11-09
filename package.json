@@ -4,11 +4,14 @@
   "description": "STEWARD — The AP Clerk That Can't Be Tricked. Private AI Invoice Processing, Deterministic Fraud Prevention, and Exact-Output Cross-Chain Payments via NEAR Intents.",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
     "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:client\"",
     "dev:server": "tsx watch src/server/index.ts",
     "dev:client": "vite",
-    "build": "vite build && tsc -p tsconfig.server.json",
+    "build": "vite build && tsc -p tsconfig.server.json && node -e \"require('node:fs').copyFileSync('src/pipeline/pdfWorkerRunner.cjs', 'dist/pipeline/pdfWorkerRunner.cjs')\"",
     "start": "node dist/server/index.js",
     "test": "vitest run",
     "test:watch": "vitest",

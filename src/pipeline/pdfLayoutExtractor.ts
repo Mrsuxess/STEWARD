@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import type {
   ExtractedInvoice,
@@ -107,7 +108,16 @@ export async function extractInvoiceFromPdfLayout(
 
   try {
     const currentDir = path.dirname(fileURLToPath(import.meta.url));
-    const workerScript = path.join(currentDir, 'pdfWorkerRunner.cjs');
+    let workerScript = path.join(currentDir, 'pdfWorkerRunner.cjs');
+    if (!fs.existsSync(workerScript)) {
+      const srcFallback = path.resolve(process.cwd(), 'src', 'pipeline', 'pdfWorkerRunner.cjs');
+      const distFallback = path.resolve(process.cwd(), 'dist', 'pipeline', 'pdfWorkerRunner.cjs');
+      if (fs.existsSync(distFallback)) {
+        workerScript = distFallback;
+      } else if (fs.existsSync(srcFallback)) {
+        workerScript = srcFallback;
+      }
+    }
     const stdout = execFileSync('node', [workerScript], {
       input: fileBuffer,
       maxBuffer: 16 * 1024 * 1024,

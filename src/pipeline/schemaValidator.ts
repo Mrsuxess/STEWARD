@@ -3,13 +3,18 @@ import type {
   ExtractedInvoice,
   PromptInjectionFinding,
   ValidationOutcome,
+  FieldConfidenceInfo,
+  FieldConfidenceLevel,
+  DiscrepancyClassification,
+  ArithmeticVerificationDetails,
 } from '../shared/types.js';
+import { validateNetworkAddress } from './pdfLayoutExtractor.js';
 
 export const InvoiceLineItemSchema = z.object({
   description: z.string().min(1, 'Line item description is required'),
   quantity: z.number().positive('Line item quantity must be positive'),
-  unitPrice: z.number().nonnegative('Line item unitPrice must be non-negative'),
-  amount: z.number().nonnegative('Line item amount must be non-negative'),
+  unitPrice: z.number(),
+  amount: z.number(),
 });
 
 export const ExtractedInvoiceSchema = z.object({
@@ -121,6 +126,16 @@ export function validateExtractedInvoice(
       errors.push(`${issue.path.join('.')}: ${issue.message}`);
     }
     const injectionFindings = scanForPromptInjection(rawTextForSecurityScan);
+    const hasZeroOrNegativeAmount = parseResult.error.issues.some(
+      (i) =>
+        i.message.toLowerCase().includes('positive') ||
+        i.message.toLowerCase().includes('negative')
+    );
+    const discrepancyType: DiscrepancyClassification =
+      injectionFindings.length > 0 || hasZeroOrNegativeAmount
+        ? 'GENUINE_DISCREPANCY'
+        : 'EXTRACTION_FAILURE';
+
     return {
       parsed: null,
       outcome: {
@@ -132,13 +147,16 @@ export function validateExtractedInvoice(
         arithmeticDiff: 0,
         errors,
         injectionFindings,
+        discrepancyType,
+        overallConfidence: 'UNCERTAIN',
+        uncertainFields: errors.map((e) => e.split(':')[0]),
       },
     };
   }
 
   const inv = parseResult.data;
 
-  // Verify each line item quantity * unitPrice == amount (tolerance $0.02)
+  // 1. Verify each line item quantity * unitPrice == amount (tolerance $0.02)
   let calculatedLineItemSum = 0;
   let lineMathValid = true;
 
@@ -180,6 +198,140 @@ export function validateExtractedInvoice(
     }
   }
 
+  // 2. Compute Arithmetic Verification Details
+  const arithmeticDetails: ArithmeticVerificationDetails = {
+    calculatedSubtotal: calculatedLineItemSum,
+    extractedSubtotal: inv.subtotal,
+    calculatedTotal,
+    extractedTotal: inv.total,
+    tax: inv.tax,
+    discounts: 0,
+    additionalCharges: 0,
+    verificationResult: arithmeticValid ? 'PASS' : 'FAIL',
+    lineItemCount: inv.lineItems.length,
+    difference: arithmeticDiff,
+  };
+
+  // 3. Field-Level Confidence Assessment
+  const isWalletValidFormat = validateNetworkAddress(
+    inv.receivingWalletAddress,
+    inv.requestedDestinationChain
+  );
+  const isWalletMissingOrEmpty =
+    !inv.receivingWalletAddress ||
+    inv.receivingWalletAddress.trim() === '' ||
+    inv.receivingWalletAddress === 'UNKNOWN' ||
+    inv.receivingWalletAddress.includes('unclear_split');
+
+  const confidenceMap: Record<string, FieldConfidenceInfo> = {
+    vendorName: {
+      field: 'vendorName',
+      value: inv.vendorName,
+      confidence: inv.vendorName && inv.vendorName !== 'Unknown Vendor' ? 'HIGH' : 'UNCERTAIN',
+      isUncertain: !inv.vendorName || inv.vendorName === 'Unknown Vendor',
+      uncertaintyReason:
+        !inv.vendorName || inv.vendorName === 'Unknown Vendor'
+          ? 'Vendor name could not be identified with certainty'
+          : undefined,
+    },
+    vendorId: {
+      field: 'vendorId',
+      value: inv.vendorId,
+      confidence: inv.vendorId ? 'HIGH' : 'MEDIUM',
+      isUncertain: false,
+    },
+    invoiceNumber: {
+      field: 'invoiceNumber',
+      value: inv.invoiceNumber,
+      confidence: inv.invoiceNumber && inv.invoiceNumber !== 'INV-UNKNOWN' ? 'HIGH' : 'UNCERTAIN',
+      isUncertain: !inv.invoiceNumber || inv.invoiceNumber === 'INV-UNKNOWN',
+    },
+    invoiceDate: {
+      field: 'invoiceDate',
+      value: inv.invoiceDate,
+      confidence: 'HIGH',
+      isUncertain: false,
+    },
+    dueDate: {
+      field: 'dueDate',
+      value: inv.dueDate,
+      confidence: 'HIGH',
+      isUncertain: false,
+    },
+    lineItems: {
+      field: 'lineItems',
+      value: inv.lineItems,
+      confidence: lineMathValid ? 'HIGH' : 'LOW',
+      isUncertain: !lineMathValid,
+      uncertaintyReason: !lineMathValid ? 'Line item arithmetic mismatch detected' : undefined,
+    },
+    subtotal: {
+      field: 'subtotal',
+      value: inv.subtotal,
+      confidence: subtotalDiff <= 0.02 ? 'HIGH' : 'LOW',
+      isUncertain: subtotalDiff > 0.02,
+      uncertaintyReason: subtotalDiff > 0.02 ? 'Subtotal differs from sum of line items' : undefined,
+    },
+    tax: {
+      field: 'tax',
+      value: inv.tax,
+      confidence: 'HIGH',
+      isUncertain: false,
+    },
+    total: {
+      field: 'total',
+      value: inv.total,
+      confidence: totalDiff <= 0.02 ? 'HIGH' : 'LOW',
+      isUncertain: totalDiff > 0.02,
+      uncertaintyReason: totalDiff > 0.02 ? 'Total differs from subtotal plus tax' : undefined,
+    },
+    payoutAsset: {
+      field: 'payoutAsset',
+      value: inv.requestedPayoutAsset,
+      confidence: 'HIGH',
+      isUncertain: false,
+    },
+    destinationChain: {
+      field: 'destinationChain',
+      value: inv.requestedDestinationChain,
+      confidence: 'HIGH',
+      isUncertain: false,
+    },
+    receivingWallet: {
+      field: 'receivingWallet',
+      value: inv.receivingWalletAddress,
+      confidence: isWalletValidFormat ? 'HIGH' : isWalletMissingOrEmpty ? 'UNCERTAIN' : 'LOW',
+      isUncertain: isWalletMissingOrEmpty,
+      uncertaintyReason: !isWalletValidFormat
+        ? `Receiving address "${inv.receivingWalletAddress}" does not conform to ${inv.requestedDestinationChain} address syntax`
+        : undefined,
+    },
+  };
+
+  const uncertainFields = Object.values(confidenceMap)
+    .filter((f) => f.isUncertain)
+    .map((f) => f.field);
+
+  // 4. Discrepancy Classification: Distinguish between genuine fraud and parsing failures
+  let discrepancyType: DiscrepancyClassification | undefined = undefined;
+  if (injectionFindings.length > 0 || inv.total <= 0 || inv.subtotal <= 0) {
+    discrepancyType = 'GENUINE_DISCREPANCY';
+  } else if (isWalletMissingOrEmpty) {
+    discrepancyType = 'EXTRACTION_FAILURE';
+  } else if (!arithmeticValid) {
+    // If line items and totals are cleanly parsed but numbers mathematically don't add up, it's genuine discrepancy
+    discrepancyType = 'GENUINE_DISCREPANCY';
+  } else if (uncertainFields.length > 0) {
+    discrepancyType = 'AMBIGUOUS_FIELD';
+  }
+
+  const overallConfidence: FieldConfidenceLevel =
+    uncertainFields.length === 0 && arithmeticValid
+      ? 'HIGH'
+      : uncertainFields.length > 2 || !arithmeticValid
+        ? 'LOW'
+        : 'MEDIUM';
+
   return {
     parsed: inv,
     outcome: {
@@ -191,6 +343,11 @@ export function validateExtractedInvoice(
       arithmeticDiff,
       errors,
       injectionFindings,
+      confidenceMap,
+      overallConfidence,
+      discrepancyType,
+      arithmeticDetails,
+      uncertainFields,
     },
   };
 }

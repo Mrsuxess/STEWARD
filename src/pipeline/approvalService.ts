@@ -5,7 +5,10 @@ import {
   saveProcessedInvoice,
   logSecurityEvent,
 } from '../server/db.js';
-import { executeAuthorizedPayment } from './paymentExecutionService.js';
+import {
+  executeAuthorizedPayment,
+  independentlyRevalidateBeforeExecution,
+} from './paymentExecutionService.js';
 import type { ProcessedInvoiceRecord } from '../shared/types.js';
 
 export async function approveHeldInvoice(
@@ -57,12 +60,35 @@ export async function approveHeldInvoice(
     updatedAt: nowIso,
   };
 
-  // Payment service independently revalidates before executing!
+  // Pre-execution re-validation: verify kill_switch, daily_cap_usd, blocklist, and vendor status
+  const revalidation = independentlyRevalidateBeforeExecution(updatedRecord, db);
+  if (!revalidation.allowed) {
+    logSecurityEvent(
+      {
+        invoiceId: invoice.id,
+        invoiceNumber: invoice.invoiceNumber,
+        vendorName: invoice.vendorName,
+        severity: 'CRITICAL',
+        category: 'LIMIT_EXCEEDED',
+        title: `Approval Execution Blocked for Invoice #${invoice.invoiceNumber}`,
+        description: `Controller "${operator}" attempted to approve invoice #${invoice.invoiceNumber}, but pre-execution revalidation blocked settlement: ${revalidation.reason}`,
+        metadataJson: JSON.stringify({ approvedBy: operator, reason: revalidation.reason }),
+      },
+      db
+    );
+    throw new Error(
+      `Approval blocked by pre-execution policy verification: ${revalidation.reason}`
+    );
+  }
+
+  // Payment service independently revalidates and settles
   const paymentExecution = await executeAuthorizedPayment(updatedRecord, {
     allowNetwork: input.allowNetwork,
     db,
   });
 
+  // When a HELD invoice is approved and settled, update finalDecision to PAY
+  updatedRecord.finalDecision = 'PAY';
   updatedRecord.paymentStatus = paymentExecution.status;
   updatedRecord.paymentExecution = paymentExecution;
 

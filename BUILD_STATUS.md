@@ -34,4 +34,8 @@
   - Implemented `src/evaluation/redTeamAndSuite.ts` and `src/evaluation/runCliEvaluation.ts` with 10 featured Red-Team scenarios and 30 synthetic evaluation cases (`100%` accuracy, `0` unauthorized payments, `1.88ms` median decision time).
   - Built 9-view React + TypeScript + Tailwind CSS institutional financial operations frontend (`src/client/App.tsx`, `PrivateAiVerifiedPanel.tsx`, `PipelineTraceModal.tsx`).
 - [x] **Milestone 4 — Comprehensive Test Suite (Unit, Integration, Security, E2E) & Build Verification**
-  - Implemented `tests/steward.test.ts` (14 test suites covering Unit, Security, Live Integration, and E2E API workflows — 14/14 passing).
+  - Implemented `tests/steward.test.ts` (26 test suites covering Unit, Security, Live Integration, E2E API workflows, and Non-Custodial Treasury & Wallet Adapters — 26/26 passing).
+- [x] **Milestone 5 — Non-Custodial Treasury Upgrade (NEAR Wallet + MetaMask + 11-State 1Click Lifecycle)**
+  - Integrated `@hot-labs/near-connect` (`NearConnectWalletAdapter`) and `EIP-1193` (`MetaMaskWalletAdapter`) behind the unified `TreasuryWalletAdapter` interface (`src/client/wallets/`).
+  - Built dedicated **Treasury Dashboard** (`TreasuryDashboardView.tsx`) and **Payment Authorization Modal** (`PaymentAuthorizationModal.tsx`).
+  - Added live NEAR Mainnet & EVM (Base, Arbitrum, Ethereum) balance retrieval (`fetchNearAccountBalances`, `fetchEvmAccountBalances`), live 1Click token registry discovery (`/v0/tokens`), dry & committed quotes (`dry: true` / `dry: false`), wallet-specific deposit payload construction (NEAR NEP-141 `ft_transfer` + `storage_deposit` / native `Transfer`; EVM ERC-20 `transfer(address,uint256)` selector `0xa9059cbb` / native ETH), deposit hash submission (`/v0/deposit/submit`), and 11-state payment lifecycle tracking.

@@ -210,8 +210,22 @@ export function verifyBinaryIntelTdxQuoteV4(
       rootCaFingerprint = certs[2].fingerprint256;
       const matchesIntelRoot = rootCaFingerprint === EXPECTED_INTEL_SGX_ROOT_CA_FINGERPRINT256;
 
+      const nowMs = Date.now();
+      const certsWithinValidityWindow = certs.slice(0, 3).every((c) => {
+        const fromMs = Date.parse(c.validFrom);
+        const toMs = Date.parse(c.validTo);
+        return Number.isFinite(fromMs) && Number.isFinite(toMs) && fromMs <= nowMs && nowMs <= toMs;
+      });
+      if (!certsWithinValidityWindow) {
+        errors.push(`${label}: One or more Intel SGX/TDX PCK X.509 certificates are expired or not yet valid.`);
+      }
+
       pckCertChainValid =
-        leafSignedByIntermediate && intermediateSignedByRoot && rootSelfSigned && matchesIntelRoot;
+        leafSignedByIntermediate &&
+        intermediateSignedByRoot &&
+        rootSelfSigned &&
+        matchesIntelRoot &&
+        certsWithinValidityWindow;
       if (!pckCertChainValid) {
         errors.push(`${label}: Intel SGX/TDX PCK Certificate Chain failed root-of-trust validation.`);
       }
@@ -446,6 +460,8 @@ export async function fetchAndVerifyNearAiAttestation(
   options?: {
     tamperQuote?: boolean;
     tamperNonce?: boolean;
+    tamperMeasurements?: boolean;
+    tamperCert?: boolean;
   }
 ): Promise<AttestationVerificationResult> {
   const nonce = generateFresh32ByteNonce();
@@ -483,15 +499,33 @@ export async function fetchAndVerifyNearAiAttestation(
       report.gateway_attestation.intel_quote = q.slice(0, 200) + flippedByte + q.slice(202);
     }
 
+    if (options?.tamperMeasurements && report.gateway_attestation?.info?.tcb_info) {
+      // Tamper with the reported TCB MRTD measurement so it diverges from the binary TDX quote body
+      report.gateway_attestation.info.tcb_info.mrtd = '00'.repeat(48);
+    }
+
+    if (options?.tamperCert && report.gateway_attestation?.intel_quote) {
+      // Truncate the appended X.509 PCK certificate chain inside the TDX quote certification data
+      const q = report.gateway_attestation.intel_quote;
+      report.gateway_attestation.intel_quote = q.slice(0, 2500);
+    }
+
     const verificationNonce = options?.tamperNonce
       ? generateFresh32ByteNonce() // Different nonce to prove replay/mismatch rejection
       : nonce;
+
+    const isTamperTest = Boolean(
+      options?.tamperQuote ||
+        options?.tamperNonce ||
+        options?.tamperMeasurements ||
+        options?.tamperCert
+    );
 
     return verifyAttestationReportPayload(
       report,
       verificationNonce,
       modelId,
-      options?.tamperQuote || options?.tamperNonce ? 'tamper_test' : 'live_near_ai_cloud'
+      isTamperTest ? 'tamper_test' : 'live_near_ai_cloud'
     );
   } catch (err) {
     return buildFailedAttestationResult(

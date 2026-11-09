@@ -17,4 +17,12 @@ export default defineConfig({
       },
     },
   },
+  test: {
+    pool: 'forks',
+    server: {
+      deps: {
+        external: ['pdf-parse'],
+      },
+    },
+  },
 });

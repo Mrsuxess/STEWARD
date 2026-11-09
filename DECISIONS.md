@@ -63,3 +63,17 @@ This document records the core architectural and engineering decisions made whil
   - `https://api.outlayer.ai/health` is live (`{"status":"ok","version":"0.1.0","git_sha":"451b270a070f"}`).
   - Therefore, our OutLayer custody adapter explicitly configures `baseUrl: process.env.OUTLAYER_API_BASE_URL || 'https://api.outlayer.ai'`.
   - We also document the exact security properties and limitations of OutLayer TEE custody vs. NEAR Function-Call Access Keys (which cannot natively attach arbitrary `1 yoctoNEAR` deposits required by NEP-141 `ft_transfer` unless calling through a dedicated treasury proxy contract) vs. a server-side policy-gated signer.
+
+---
+
+## ADR-006: Non-Custodial Browser Treasury Wallet Architecture (`@hot-labs/near-connect` + MetaMask `EIP-1193`)
+
+- **Decision**: Support two real, non-custodial browser treasury wallet connections (**NEAR Wallet** via `@hot-labs/near-connect` and **MetaMask** via `EIP-1193`) behind a unified `TreasuryWalletAdapter` interface, while keeping wallet connection, invoice policy authorization, and cryptographic transaction signing strictly separated.
+- **Key Architectural Rules**:
+  1. **Zero Private Key Custody**: STEWARD never requests, accepts, or stores private keys or seed phrases.
+  2. **Two-Phase 1Click Quote Lifecycle**:
+     - Preview quotes use `dry: true` (`APPROVED` status, `depositAddress: null`) so controllers can inspect exact source input amounts, USD valuations, slippage buffers, and fees without locking solver liquidity.
+     - Committed quotes use `dry: false` (`AWAITING_WALLET_SIGNATURE` status) only when the controller explicitly clicks **Commit Live 1Click Quote**, returning a single-use `depositAddress` and constructing the exact unsigned transaction for the connected wallet.
+  3. **Wallet-Specific Deposit Construction**:
+     - For **NEAR Wallet**: Distinguishes native NEAR `Transfer` from NEP-141 `ft_transfer` (`1 yoctoNEAR` attached deposit + `30 TGas`) and automatically checks `storage_balance_of` on the NEP-141 contract, prepending `storage_deposit` (`0.00125 NEAR`) when the 1Click `depositAddress` is not yet registered.
+     - For **MetaMask**: Distinguishes native ETH transfers from ERC-20 `transfer(address,uint256)` calls (ABI selector `0xa9059cbb`), verifies `chainId` (`0x1` Ethereum, `0x2105` Base, `0xa4b1` Arbitrum), and estimates gas via `eth_estimateGas`.

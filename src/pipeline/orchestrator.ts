@@ -69,6 +69,16 @@ export async function processInvoiceThroughStewardPipeline(
   // 4. Vendor Registry Check
   const vendorCheck = evaluateVendorRegistry(effectiveInvoice, db);
 
+  // If vendor was identified by Vendor ID or Registry match, resolve vendor name
+  if (
+    vendorCheck.matchedVendor &&
+    (!effectiveInvoice.vendorName ||
+      effectiveInvoice.vendorName.trim().toLowerCase() === 'unknown vendor' ||
+      effectiveInvoice.vendorName.trim() === '')
+  ) {
+    effectiveInvoice.vendorName = vendorCheck.matchedVendor.businessName;
+  }
+
   // 5. Counterparty Risk Engine
   const riskAssessment = await assessCounterpartyRisk(
     {
@@ -140,6 +150,8 @@ export async function processInvoiceThroughStewardPipeline(
     paymentExecution: null,
     rawTextDeleted: true, // Raw buffer was zeroed in nearAiExtraction.ts and never persisted
     processingTimeMs: Date.now() - startMs,
+    fieldCorrections: [],
+    discrepancyClassification: validation.discrepancyType,
     createdAt: nowIso,
     updatedAt: nowIso,
   };

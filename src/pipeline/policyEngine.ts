@@ -98,16 +98,30 @@ export function evaluatePaymentPolicy(
     });
   }
 
-  // Rule B3: Schema or Arithmetic Inconsistency
+  // Rule B3: Schema or Arithmetic Inconsistency vs Parsing Uncertainty
   if (!input.validation.schemaValid || !input.validation.arithmeticValid) {
-    reasons.push({
-      code: 'ARITHMETIC_OR_SCHEMA_INVALID',
-      rule: 'integrity.invoice_arithmetic',
-      decisionImpact: 'BLOCK',
-      message:
-        input.validation.errors.join(' ') ||
-        'Invoice failed schema validation or line-item/tax/total arithmetic consistency check.',
-    });
+    if (
+      input.validation.discrepancyType === 'EXTRACTION_FAILURE' ||
+      input.validation.discrepancyType === 'AMBIGUOUS_FIELD'
+    ) {
+      reasons.push({
+        code: 'EXTRACTION_UNCERTAINTY_HOLD',
+        rule: 'integrity.parsing_confidence',
+        decisionImpact: 'HOLD',
+        message:
+          input.validation.errors.join(' ') ||
+          'Invoice field extraction uncertainty detected. Routed to Human Review Queue. A parsing failure is not classified as fraud.',
+      });
+    } else {
+      reasons.push({
+        code: 'ARITHMETIC_OR_SCHEMA_INVALID',
+        rule: 'integrity.invoice_arithmetic',
+        decisionImpact: 'BLOCK',
+        message:
+          input.validation.errors.join(' ') ||
+          'Invoice failed schema validation or line-item/tax/total arithmetic consistency check.',
+      });
+    }
   }
 
   // Rule B4: Duplicate Invoice Detection
@@ -126,19 +140,39 @@ export function evaluatePaymentPolicy(
   }
 
   // Rule B5: Blocklisted Address or Counterparty Risk BLOCK
-  if (input.riskAssessment.isBlocklisted || input.riskAssessment.decision === 'BLOCK') {
-    const blockReasons = input.riskAssessment.reasons
-      .filter((r) => r.severity === 'CRITICAL')
-      .map((r) => r.message)
-      .join(' ');
+  if (input.riskAssessment.isBlocklisted) {
     reasons.push({
-      code: input.riskAssessment.isBlocklisted ? 'BLOCKLISTED_ADDRESS' : 'COUNTERPARTY_RISK_BLOCK',
-      rule: 'counterparty.risk_engine',
+      code: 'BLOCKLISTED_ADDRESS',
+      rule: 'counterparty.blocklist',
       decisionImpact: 'BLOCK',
-      message:
-        blockReasons ||
-        `Counterparty Risk Engine returned BLOCK (score ${input.riskAssessment.riskScore}/100).`,
+      message: 'Destination address is on the global sanctions/threat blocklist.',
     });
+  } else if (input.riskAssessment.decision === 'BLOCK') {
+    if (
+      input.validation.discrepancyType === 'EXTRACTION_FAILURE' ||
+      input.validation.discrepancyType === 'AMBIGUOUS_FIELD'
+    ) {
+      reasons.push({
+        code: 'EXTRACTION_UNCERTAINTY_HOLD',
+        rule: 'integrity.parsing_confidence',
+        decisionImpact: 'HOLD',
+        message:
+          'Destination address appears truncated or ambiguous due to PDF layout wrapping. Held for controller verification.',
+      });
+    } else {
+      const blockReasons = input.riskAssessment.reasons
+        .filter((r) => r.severity === 'CRITICAL')
+        .map((r) => r.message)
+        .join(' ');
+      reasons.push({
+        code: 'COUNTERPARTY_RISK_BLOCK',
+        rule: 'counterparty.risk_engine',
+        decisionImpact: 'BLOCK',
+        message:
+          blockReasons ||
+          `Counterparty Risk Engine returned BLOCK (score ${input.riskAssessment.riskScore}/100).`,
+      });
+    }
   }
 
   // Rule B6: Unauthorized Payout Asset
@@ -195,6 +229,18 @@ export function evaluatePaymentPolicy(
       rule: 'new_vendor',
       decisionImpact: impact,
       message: `Vendor "${input.invoice.vendorName}" is not in the Verified Vendor Registry. Policy new_vendor=${policy.new_vendor} requires human review.`,
+    });
+  }
+
+  // Rule H1b: Matched Vendor is Not Verified (e.g. PENDING_APPROVAL or Vendor Name/ID Mismatch)
+  if (!input.vendorCheck.isNewVendor && !input.vendorCheck.isVerifiedVendor) {
+    reasons.push({
+      code: 'VENDOR_NOT_VERIFIED_OR_NAME_MISMATCH',
+      rule: 'vendor.verification_required',
+      decisionImpact: 'HOLD',
+      message:
+        input.vendorCheck.discrepancies.map((d) => d.message).join(' ') ||
+        `Vendor "${input.invoice.vendorName}" is not yet verified in the Vendor Registry.`,
     });
   }
 

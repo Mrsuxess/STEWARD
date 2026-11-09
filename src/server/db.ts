@@ -10,6 +10,14 @@ import type {
   PaymentExecutionRecord,
   SecurityEventRecord,
   SupportedChain,
+  TreasurySettings,
+  ConnectedWalletRecord,
+  PaymentLifecycleStatus,
+  TreasuryWalletType,
+  WorkspaceProfile,
+  WorkspaceMemberRecord,
+  WorkspaceRole,
+  ExperienceMode,
 } from '../shared/types.js';
 
 let dbInstance: DatabaseSync | null = null;
@@ -127,6 +135,7 @@ function initSchema(db: DatabaseSync): void {
       rejection_reason TEXT,
       raw_text_deleted INTEGER NOT NULL DEFAULT 1,
       processing_time_ms INTEGER NOT NULL DEFAULT 0,
+      field_corrections_json TEXT NOT NULL DEFAULT '[]',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -138,27 +147,69 @@ function initSchema(db: DatabaseSync): void {
       mode TEXT NOT NULL,
       custody_mode TEXT NOT NULL,
       status TEXT NOT NULL,
+      lifecycle_status TEXT,
       quote_id TEXT,
       correlation_id TEXT,
       deposit_address TEXT,
       source_asset TEXT NOT NULL,
+      source_asset_id TEXT,
       destination_asset TEXT NOT NULL,
+      destination_asset_id TEXT,
       source_chain TEXT NOT NULL,
       destination_chain TEXT NOT NULL,
+      source_wallet_address TEXT,
+      source_wallet_type TEXT,
       exact_requested_output TEXT NOT NULL,
       exact_requested_output_raw TEXT NOT NULL,
       estimated_input_amount TEXT NOT NULL,
+      estimated_input_raw TEXT,
+      min_input_amount_raw TEXT,
       actual_received_amount TEXT,
       fees_usd REAL NOT NULL DEFAULT 0,
+      slippage_bps INTEGER DEFAULT 100,
+      time_estimate_seconds INTEGER,
+      quote_expires_at TEXT,
+      is_dry_quote INTEGER DEFAULT 0,
+      is_simulated_quote INTEGER DEFAULT 0,
+      is_simulated_transaction INTEGER DEFAULT 0,
       refund_address TEXT NOT NULL,
       recipient_address TEXT NOT NULL,
       tx_hash TEXT,
+      destination_tx_hash TEXT,
       explorer_url TEXT,
+      destination_explorer_url TEXT,
       quote_signature TEXT,
       status_source TEXT NOT NULL,
+      refund_reason TEXT,
       error_message TEXT,
+      prepared_transaction_json TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS treasury_settings (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      settings_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS treasury_wallets (
+      id TEXT PRIMARY KEY,
+      wallet_type TEXT NOT NULL,
+      wallet_id TEXT NOT NULL,
+      wallet_name TEXT NOT NULL,
+      address TEXT NOT NULL,
+      network TEXT NOT NULL,
+      chain TEXT NOT NULL,
+      chain_id_hex TEXT,
+      is_simulated INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL,
+      native_balance_json TEXT,
+      token_balances_json TEXT NOT NULL,
+      capabilities_json TEXT NOT NULL,
+      unsupported_capabilities_json TEXT NOT NULL,
+      last_refreshed_at TEXT NOT NULL,
+      connected_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS security_events (
@@ -173,7 +224,71 @@ function initSchema(db: DatabaseSync): void {
       metadata_json TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS workspace_profile (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      company_name TEXT NOT NULL,
+      business_email TEXT NOT NULL,
+      country TEXT NOT NULL,
+      business_type TEXT NOT NULL,
+      reporting_currency TEXT NOT NULL,
+      experience_mode TEXT NOT NULL,
+      onboarding_completed INTEGER NOT NULL DEFAULT 0,
+      onboarding_step INTEGER NOT NULL DEFAULT 1,
+      checklist_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS workspace_members (
+      id TEXT PRIMARY KEY,
+      full_name TEXT NOT NULL,
+      email TEXT NOT NULL UNIQUE,
+      role TEXT NOT NULL,
+      status TEXT NOT NULL,
+      invited_at TEXT NOT NULL
+    );
   `);
+
+  try {
+    db.exec('ALTER TABLE vendors ADD COLUMN contact_email TEXT;');
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    db.exec("ALTER TABLE invoices ADD COLUMN field_corrections_json TEXT NOT NULL DEFAULT '[]';");
+  } catch {
+    // Column already exists
+  }
+
+  // Safe non-destructive schema migration for existing SQLite files
+  const paymentColumns = [
+    ['lifecycle_status', 'TEXT'],
+    ['source_asset_id', 'TEXT'],
+    ['destination_asset_id', 'TEXT'],
+    ['source_wallet_address', 'TEXT'],
+    ['source_wallet_type', 'TEXT'],
+    ['estimated_input_raw', 'TEXT'],
+    ['min_input_amount_raw', 'TEXT'],
+    ['slippage_bps', 'INTEGER DEFAULT 100'],
+    ['time_estimate_seconds', 'INTEGER'],
+    ['quote_expires_at', 'TEXT'],
+    ['is_dry_quote', 'INTEGER DEFAULT 0'],
+    ['is_simulated_quote', 'INTEGER DEFAULT 0'],
+    ['is_simulated_transaction', 'INTEGER DEFAULT 0'],
+    ['destination_tx_hash', 'TEXT'],
+    ['destination_explorer_url', 'TEXT'],
+    ['refund_reason', 'TEXT'],
+    ['prepared_transaction_json', 'TEXT'],
+  ];
+  for (const [col, colType] of paymentColumns) {
+    try {
+      db.exec(`ALTER TABLE payments ADD COLUMN ${col} ${colType};`);
+    } catch {
+      // Column already exists
+    }
+  }
 }
 
 export function loadDefaultPolicyFromYaml(): PolicyConfig {
@@ -447,6 +562,83 @@ function seedDefaultsIfEmpty(db: DatabaseSync): void {
       insertBlock.run(item.address.toLowerCase(), item.chain, item.reason, item.source, now);
     }
   }
+
+  const workspaceRow = db.prepare('SELECT id FROM workspace_profile WHERE id = 1').get();
+  if (!workspaceRow) {
+    const now = new Date().toISOString();
+    const defaultChecklist = {
+      businessProfileCompleted: true,
+      treasuryConnected: false,
+      paymentPoliciesConfigured: true,
+      firstVendorAdded: true,
+      firstInvoiceUploaded: true,
+    };
+    db.prepare(`
+      INSERT INTO workspace_profile (
+        id, company_name, business_email, country, business_type,
+        reporting_currency, experience_mode, onboarding_completed,
+        onboarding_step, checklist_json, created_at, updated_at
+      ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'Steward Global Operations Ltd.',
+      'finance@steward-ap.finance',
+      'United Kingdom',
+      'Cross-Border SaaS & Digital Services',
+      'USD',
+      'simulated',
+      0,
+      1,
+      JSON.stringify(defaultChecklist),
+      now,
+      now
+    );
+  }
+
+  const memberCountRow = db.prepare('SELECT COUNT(*) as cnt FROM workspace_members').get() as { cnt: number };
+  if (memberCountRow.cnt === 0) {
+    const now = new Date().toISOString();
+    const initialMembers: WorkspaceMemberRecord[] = [
+      {
+        id: 'MEM-OWNER-01',
+        fullName: 'Elena Rostova',
+        email: 'controller@steward-ap.finance',
+        role: 'Owner',
+        status: 'ACTIVE',
+        invitedAt: now,
+      },
+      {
+        id: 'MEM-ADMIN-02',
+        fullName: 'Marcus Vance',
+        email: 'admin@steward-ap.finance',
+        role: 'Finance Administrator',
+        status: 'ACTIVE',
+        invitedAt: now,
+      },
+      {
+        id: 'MEM-APPROVER-03',
+        fullName: 'Amara Okafor',
+        email: 'approver@steward-ap.finance',
+        role: 'Approver',
+        status: 'ACTIVE',
+        invitedAt: now,
+      },
+      {
+        id: 'MEM-AUDITOR-04',
+        fullName: 'Henrik Lindqvist',
+        email: 'auditor@steward-ap.finance',
+        role: 'Auditor',
+        status: 'ACTIVE',
+        invitedAt: now,
+      },
+    ];
+    const insertMem = db.prepare(`
+      INSERT INTO workspace_members (id, full_name, email, role, status, invited_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    for (const m of initialMembers) {
+      insertMem.run(m.id, m.fullName, m.email.toLowerCase(), m.role, m.status, m.invitedAt);
+    }
+  }
 }
 
 export function getPolicyConfig(db = getDb()): PolicyConfig {
@@ -505,6 +697,7 @@ function mapVendorRow(row: Record<string, unknown>): VendorRecord {
   return {
     id: String(row.id),
     businessName: String(row.business_name),
+    contactEmail: row.contact_email ? String(row.contact_email) : null,
     verifiedWalletAddress: String(row.verified_wallet_address),
     preferredPayoutAsset: String(row.preferred_payout_asset),
     preferredDestinationChain: String(row.preferred_destination_chain) as SupportedChain,
@@ -574,6 +767,21 @@ export function listBlocklist(db = getDb()): Array<{
   }));
 }
 
+export function recordFieldCorrection(
+  invoiceId: string,
+  correction: import('../shared/types.js').FieldCorrectionEntry,
+  db = getDb()
+): ProcessedInvoiceRecord {
+  const inv = getInvoiceById(invoiceId, db);
+  if (!inv) throw new Error(`Invoice ${invoiceId} not found`);
+  const list = inv.fieldCorrections || [];
+  list.push(correction);
+  inv.fieldCorrections = list;
+  inv.updatedAt = new Date().toISOString();
+  saveProcessedInvoice(inv, db);
+  return inv;
+}
+
 export function saveProcessedInvoice(record: ProcessedInvoiceRecord, db = getDb()): void {
   db.prepare(`
     INSERT OR REPLACE INTO invoices (
@@ -583,8 +791,8 @@ export function saveProcessedInvoice(record: ProcessedInvoiceRecord, db = getDb(
       extraction_model, attestation_json, validation_json, vendor_check_json,
       risk_assessment_json, policy_evaluation_json, final_decision, payment_status,
       decision_reason_summary, approved_by, approved_at, rejection_reason,
-      raw_text_deleted, processing_time_ms, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      raw_text_deleted, processing_time_ms, field_corrections_json, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     record.id,
     record.mode,
@@ -617,6 +825,7 @@ export function saveProcessedInvoice(record: ProcessedInvoiceRecord, db = getDb(
     record.rejectionReason,
     record.rawTextDeleted ? 1 : 0,
     record.processingTimeMs,
+    JSON.stringify(record.fieldCorrections || []),
     record.createdAt,
     record.updatedAt
   );
@@ -625,13 +834,16 @@ export function saveProcessedInvoice(record: ProcessedInvoiceRecord, db = getDb(
 export function savePaymentExecution(payment: PaymentExecutionRecord, db = getDb()): void {
   db.prepare(`
     INSERT OR REPLACE INTO payments (
-      id, invoice_id, idempotency_key, mode, custody_mode, status,
-      quote_id, correlation_id, deposit_address, source_asset, destination_asset,
-      source_chain, destination_chain, exact_requested_output, exact_requested_output_raw,
-      estimated_input_amount, actual_received_amount, fees_usd, refund_address,
-      recipient_address, tx_hash, explorer_url, quote_signature, status_source,
-      error_message, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      id, invoice_id, idempotency_key, mode, custody_mode, status, lifecycle_status,
+      quote_id, correlation_id, deposit_address, source_asset, source_asset_id,
+      destination_asset, destination_asset_id, source_chain, destination_chain,
+      source_wallet_address, source_wallet_type, exact_requested_output, exact_requested_output_raw,
+      estimated_input_amount, estimated_input_raw, min_input_amount_raw, actual_received_amount,
+      fees_usd, slippage_bps, time_estimate_seconds, quote_expires_at, is_dry_quote,
+      is_simulated_quote, is_simulated_transaction, refund_address, recipient_address,
+      tx_hash, destination_tx_hash, explorer_url, destination_explorer_url, quote_signature,
+      status_source, refund_reason, error_message, prepared_transaction_json, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     payment.id,
     payment.invoiceId,
@@ -639,28 +851,84 @@ export function savePaymentExecution(payment: PaymentExecutionRecord, db = getDb
     payment.mode,
     payment.custodyMode,
     payment.status,
+    payment.lifecycleStatus || mapStatusToLifecycle(payment.status),
     payment.quoteId,
     payment.correlationId,
     payment.depositAddress,
     payment.sourceAsset,
+    payment.sourceAssetId ?? null,
     payment.destinationAsset,
+    payment.destinationAssetId ?? null,
     payment.sourceChain,
     payment.destinationChain,
+    payment.sourceWalletAddress ?? null,
+    payment.sourceWalletType ?? null,
     payment.exactRequestedOutput,
     payment.exactRequestedOutputRaw,
     payment.estimatedInputAmount,
+    payment.estimatedInputRaw ?? null,
+    payment.minInputAmountRaw ?? null,
     payment.actualReceivedAmount,
     payment.feesUsd,
+    payment.slippageBps ?? 100,
+    payment.timeEstimateSeconds ?? null,
+    payment.quoteExpiresAt ?? null,
+    payment.isDryQuote ? 1 : 0,
+    payment.isSimulatedQuote ? 1 : 0,
+    payment.isSimulatedTransaction ? 1 : 0,
     payment.refundAddress,
     payment.recipientAddress,
     payment.txHash,
+    payment.destinationTxHash ?? null,
     payment.explorerUrl,
+    payment.destinationExplorerUrl ?? null,
     payment.quoteSignature,
     payment.statusSource,
+    payment.refundReason ?? null,
     payment.errorMessage,
+    payment.preparedTransaction ? JSON.stringify(payment.preparedTransaction) : null,
     payment.createdAt,
     payment.updatedAt
   );
+}
+
+function mapStatusToLifecycle(status: PaymentExecutionRecord['status']): PaymentLifecycleStatus {
+  switch (status) {
+    case 'PAID':
+    case 'COMPLETED':
+      return 'COMPLETED';
+    case 'HELD':
+    case 'AWAITING_APPROVAL':
+      return 'AWAITING_APPROVAL';
+    case 'APPROVED':
+      return 'APPROVED';
+    case 'AWAITING_WALLET_SIGNATURE':
+      return 'AWAITING_WALLET_SIGNATURE';
+    case 'DEPOSIT_SUBMITTED':
+      return 'DEPOSIT_SUBMITTED';
+    case 'DEPOSIT_CONFIRMED':
+      return 'DEPOSIT_CONFIRMED';
+    case 'PENDING':
+    case 'PROCESSING':
+      return 'PROCESSING';
+    case 'REFUNDED':
+      return 'REFUNDED';
+    case 'EXPIRED':
+      return 'EXPIRED';
+    case 'BLOCKED':
+    case 'FAILED':
+      return 'FAILED';
+    default:
+      return 'DRAFT';
+  }
+}
+
+export function getPaymentById(paymentId: string, db = getDb()): PaymentExecutionRecord | null {
+  const row = db.prepare('SELECT * FROM payments WHERE id = ?').get(paymentId) as
+    | Record<string, unknown>
+    | undefined;
+  if (!row) return null;
+  return mapPaymentRow(row);
 }
 
 export function getPaymentByInvoiceId(invoiceId: string, db = getDb()): PaymentExecutionRecord | null {
@@ -681,35 +949,174 @@ export function listPayments(mode?: string, db = getDb()): PaymentExecutionRecor
 }
 
 function mapPaymentRow(row: Record<string, unknown>): PaymentExecutionRecord {
+  const status = String(row.status) as PaymentExecutionRecord['status'];
   return {
     id: String(row.id),
     invoiceId: String(row.invoice_id),
     idempotencyKey: String(row.idempotency_key),
     mode: String(row.mode) as PaymentExecutionRecord['mode'],
     custodyMode: String(row.custody_mode) as PaymentExecutionRecord['custodyMode'],
-    status: String(row.status) as PaymentExecutionRecord['status'],
+    status,
+    lifecycleStatus: row.lifecycle_status
+      ? (String(row.lifecycle_status) as PaymentLifecycleStatus)
+      : mapStatusToLifecycle(status),
     quoteId: row.quote_id ? String(row.quote_id) : null,
     correlationId: row.correlation_id ? String(row.correlation_id) : null,
     depositAddress: row.deposit_address ? String(row.deposit_address) : null,
     sourceAsset: String(row.source_asset),
+    sourceAssetId: row.source_asset_id ? String(row.source_asset_id) : null,
     destinationAsset: String(row.destination_asset),
+    destinationAssetId: row.destination_asset_id ? String(row.destination_asset_id) : null,
     sourceChain: String(row.source_chain) as SupportedChain,
     destinationChain: String(row.destination_chain) as SupportedChain,
+    sourceWalletAddress: row.source_wallet_address ? String(row.source_wallet_address) : null,
+    sourceWalletType: row.source_wallet_type
+      ? (String(row.source_wallet_type) as TreasuryWalletType)
+      : null,
     exactRequestedOutput: String(row.exact_requested_output),
     exactRequestedOutputRaw: String(row.exact_requested_output_raw),
     estimatedInputAmount: String(row.estimated_input_amount),
+    estimatedInputRaw: row.estimated_input_raw ? String(row.estimated_input_raw) : null,
+    minInputAmountRaw: row.min_input_amount_raw ? String(row.min_input_amount_raw) : null,
     actualReceivedAmount: row.actual_received_amount ? String(row.actual_received_amount) : null,
     feesUsd: Number(row.fees_usd || 0),
+    slippageBps: row.slippage_bps !== undefined && row.slippage_bps !== null ? Number(row.slippage_bps) : 100,
+    timeEstimateSeconds:
+      row.time_estimate_seconds !== undefined && row.time_estimate_seconds !== null
+        ? Number(row.time_estimate_seconds)
+        : null,
+    quoteExpiresAt: row.quote_expires_at ? String(row.quote_expires_at) : null,
+    isDryQuote: Boolean(row.is_dry_quote),
+    isSimulatedQuote: Boolean(row.is_simulated_quote),
+    isSimulatedTransaction: Boolean(row.is_simulated_transaction),
     refundAddress: String(row.refund_address),
     recipientAddress: String(row.recipient_address),
     txHash: row.tx_hash ? String(row.tx_hash) : null,
+    destinationTxHash: row.destination_tx_hash ? String(row.destination_tx_hash) : null,
     explorerUrl: row.explorer_url ? String(row.explorer_url) : null,
+    destinationExplorerUrl: row.destination_explorer_url ? String(row.destination_explorer_url) : null,
     quoteSignature: row.quote_signature ? String(row.quote_signature) : null,
     statusSource: String(row.status_source),
+    refundReason: row.refund_reason ? String(row.refund_reason) : null,
     errorMessage: row.error_message ? String(row.error_message) : null,
+    preparedTransaction: row.prepared_transaction_json
+      ? JSON.parse(String(row.prepared_transaction_json))
+      : null,
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
+}
+
+export function getDefaultTreasurySettings(): TreasurySettings {
+  return {
+    preferredFundingWalletType: 'near',
+    preferredFundingWalletAddress: null,
+    preferredSourceAsset: 'USDC',
+    preferredSourceChain: 'near',
+    allowedSourceNetworks: ['near', 'ethereum', 'base', 'arbitrum'],
+    approvedDestinationAssets: ['USDC', 'USDT', 'NEAR', 'ETH'],
+    approvedDestinationNetworks: ['near', 'arbitrum', 'base', 'ethereum', 'solana', 'bitcoin'],
+    requireExplicitWalletConfirmation: true,
+    executionMode: 'non_custodial_wallet',
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+export function getTreasurySettings(db = getDb()): TreasurySettings {
+  const row = db.prepare('SELECT settings_json FROM treasury_settings WHERE id = 1').get() as
+    | { settings_json: string }
+    | undefined;
+  if (!row) {
+    const defaults = getDefaultTreasurySettings();
+    db.prepare(
+      'INSERT OR REPLACE INTO treasury_settings (id, settings_json, updated_at) VALUES (1, ?, ?)'
+    ).run(JSON.stringify(defaults), defaults.updatedAt);
+    return defaults;
+  }
+  try {
+    return {
+      ...getDefaultTreasurySettings(),
+      ...JSON.parse(row.settings_json),
+    };
+  } catch {
+    return getDefaultTreasurySettings();
+  }
+}
+
+export function updateTreasurySettings(
+  partial: Partial<TreasurySettings>,
+  db = getDb()
+): TreasurySettings {
+  const current = getTreasurySettings(db);
+  const now = new Date().toISOString();
+  const next: TreasurySettings = {
+    ...current,
+    ...partial,
+    updatedAt: now,
+  };
+  db.prepare(
+    'INSERT OR REPLACE INTO treasury_settings (id, settings_json, updated_at) VALUES (1, ?, ?)'
+  ).run(JSON.stringify(next), now);
+  return next;
+}
+
+export function listTreasuryWallets(db = getDb()): ConnectedWalletRecord[] {
+  const rows = db
+    .prepare('SELECT * FROM treasury_wallets ORDER BY connected_at DESC')
+    .all() as Array<Record<string, unknown>>;
+  return rows.map((r) => ({
+    id: String(r.id),
+    walletType: String(r.wallet_type) as TreasuryWalletType,
+    walletId: String(r.wallet_id),
+    walletName: String(r.wallet_name),
+    address: String(r.address),
+    network: String(r.network),
+    chain: String(r.chain) as SupportedChain,
+    chainIdHex: r.chain_id_hex ? String(r.chain_id_hex) : null,
+    isSimulated: Boolean(r.is_simulated),
+    status: String(r.status) as ConnectedWalletRecord['status'],
+    nativeBalance: r.native_balance_json ? JSON.parse(String(r.native_balance_json)) : null,
+    tokenBalances: JSON.parse(String(r.token_balances_json || '[]')),
+    capabilities: JSON.parse(String(r.capabilities_json || '{}')),
+    unsupportedCapabilities: JSON.parse(String(r.unsupported_capabilities_json || '[]')),
+    lastRefreshedAt: String(r.last_refreshed_at),
+    connectedAt: String(r.connected_at),
+  }));
+}
+
+export function saveTreasuryWallet(wallet: ConnectedWalletRecord, db = getDb()): ConnectedWalletRecord {
+  db.prepare(`
+    INSERT OR REPLACE INTO treasury_wallets (
+      id, wallet_type, wallet_id, wallet_name, address, network, chain, chain_id_hex,
+      is_simulated, status, native_balance_json, token_balances_json,
+      capabilities_json, unsupported_capabilities_json, last_refreshed_at, connected_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    wallet.id,
+    wallet.walletType,
+    wallet.walletId,
+    wallet.walletName,
+    wallet.address,
+    wallet.network,
+    wallet.chain,
+    wallet.chainIdHex ?? null,
+    wallet.isSimulated ? 1 : 0,
+    wallet.status,
+    wallet.nativeBalance ? JSON.stringify(wallet.nativeBalance) : null,
+    JSON.stringify(wallet.tokenBalances || []),
+    JSON.stringify(wallet.capabilities || {}),
+    JSON.stringify(wallet.unsupportedCapabilities || []),
+    wallet.lastRefreshedAt,
+    wallet.connectedAt
+  );
+  return wallet;
+}
+
+export function removeTreasuryWallet(idOrAddress: string, db = getDb()): void {
+  db.prepare('DELETE FROM treasury_wallets WHERE id = ? OR LOWER(address) = LOWER(?)').run(
+    idOrAddress,
+    idOrAddress
+  );
 }
 
 export function getInvoiceById(id: string, db = getDb()): ProcessedInvoiceRecord | null {
@@ -765,6 +1172,9 @@ function mapInvoiceRow(row: Record<string, unknown>, db: DatabaseSync): Processe
     paymentExecution: payment,
     rawTextDeleted: Boolean(row.raw_text_deleted),
     processingTimeMs: Number(row.processing_time_ms || 0),
+    fieldCorrections: row.field_corrections_json
+      ? JSON.parse(String(row.field_corrections_json))
+      : [],
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
@@ -815,4 +1225,309 @@ export function listSecurityEvents(db = getDb()): SecurityEventRecord[] {
     metadataJson: String(r.metadata_json),
     createdAt: String(r.created_at),
   }));
+}
+
+export function getWorkspaceProfile(db = getDb()): WorkspaceProfile {
+  const row = db.prepare('SELECT * FROM workspace_profile WHERE id = 1').get() as
+    | Record<string, unknown>
+    | undefined;
+
+  const wallets = listTreasuryWallets(db);
+  const vendors = listVendors(db);
+  const invoices = listInvoices(undefined, db);
+
+  if (!row) {
+    const now = new Date().toISOString();
+    return {
+      companyName: 'Steward Global Operations Ltd.',
+      businessEmail: 'finance@steward-ap.finance',
+      country: 'United Kingdom',
+      businessType: 'Cross-Border SaaS & Digital Services',
+      reportingCurrency: 'USD',
+      experienceMode: 'simulated',
+      onboardingCompleted: false,
+      onboardingStep: 1,
+      checklistState: {
+        businessProfileCompleted: true,
+        treasuryConnected: wallets.length > 0,
+        paymentPoliciesConfigured: true,
+        firstVendorAdded: vendors.length > 0,
+        firstInvoiceUploaded: invoices.length > 0,
+      },
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+
+  let storedChecklist = {
+    businessProfileCompleted: Boolean(row.company_name),
+    treasuryConnected: false,
+    paymentPoliciesConfigured: true,
+    firstVendorAdded: false,
+    firstInvoiceUploaded: false,
+  };
+  try {
+    storedChecklist = {
+      ...storedChecklist,
+      ...JSON.parse(String(row.checklist_json || '{}')),
+    };
+  } catch {
+    // Use defaults
+  }
+
+  return {
+    companyName: String(row.company_name),
+    businessEmail: String(row.business_email),
+    country: String(row.country),
+    businessType: String(row.business_type),
+    reportingCurrency: String(row.reporting_currency) as WorkspaceProfile['reportingCurrency'],
+    experienceMode: String(row.experience_mode) as ExperienceMode,
+    onboardingCompleted: Boolean(row.onboarding_completed),
+    onboardingStep: Number(row.onboarding_step || 1),
+    checklistState: {
+      businessProfileCompleted:
+        storedChecklist.businessProfileCompleted || Boolean(String(row.company_name).trim()),
+      treasuryConnected: storedChecklist.treasuryConnected || wallets.length > 0,
+      paymentPoliciesConfigured: storedChecklist.paymentPoliciesConfigured,
+      firstVendorAdded: storedChecklist.firstVendorAdded || vendors.length > 0,
+      firstInvoiceUploaded: storedChecklist.firstInvoiceUploaded || invoices.length > 0,
+    },
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+export function updateWorkspaceProfile(
+  patch: Partial<WorkspaceProfile>,
+  db = getDb()
+): WorkspaceProfile {
+  const current = getWorkspaceProfile(db);
+  const now = new Date().toISOString();
+  const nextChecklist = {
+    ...current.checklistState,
+    ...(patch.checklistState || {}),
+  };
+  const next: WorkspaceProfile = {
+    ...current,
+    ...patch,
+    checklistState: nextChecklist,
+    updatedAt: now,
+  };
+
+  db.prepare(`
+    INSERT OR REPLACE INTO workspace_profile (
+      id, company_name, business_email, country, business_type,
+      reporting_currency, experience_mode, onboarding_completed,
+      onboarding_step, checklist_json, created_at, updated_at
+    ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    next.companyName.trim(),
+    next.businessEmail.trim(),
+    next.country.trim(),
+    next.businessType.trim(),
+    next.reportingCurrency,
+    next.experienceMode,
+    next.onboardingCompleted ? 1 : 0,
+    next.onboardingStep,
+    JSON.stringify(next.checklistState),
+    next.createdAt,
+    next.updatedAt
+  );
+
+  return getWorkspaceProfile(db);
+}
+
+export function listWorkspaceMembers(db = getDb()): WorkspaceMemberRecord[] {
+  const rows = db
+    .prepare('SELECT * FROM workspace_members ORDER BY invited_at ASC')
+    .all() as Array<Record<string, unknown>>;
+  return rows.map((r) => ({
+    id: String(r.id),
+    fullName: String(r.full_name),
+    email: String(r.email),
+    role: String(r.role) as WorkspaceRole,
+    status: String(r.status) as WorkspaceMemberRecord['status'],
+    invitedAt: String(r.invited_at),
+  }));
+}
+
+export function addWorkspaceMember(
+  input: {
+    fullName: string;
+    email: string;
+    role: WorkspaceRole;
+    status?: 'ACTIVE' | 'INVITED';
+  },
+  db = getDb()
+): WorkspaceMemberRecord {
+  const now = new Date().toISOString();
+  const cleanEmail = input.email.trim().toLowerCase();
+  const existing = db
+    .prepare('SELECT * FROM workspace_members WHERE LOWER(email) = ?')
+    .get(cleanEmail) as Record<string, unknown> | undefined;
+
+  const id = existing ? String(existing.id) : `MEM-${Date.now().toString(36).toUpperCase()}`;
+  const status = input.status || 'ACTIVE';
+
+  db.prepare(`
+    INSERT OR REPLACE INTO workspace_members (id, full_name, email, role, status, invited_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(id, input.fullName.trim(), cleanEmail, input.role, status, now);
+
+  return {
+    id,
+    fullName: input.fullName.trim(),
+    email: cleanEmail,
+    role: input.role,
+    status,
+    invitedAt: now,
+  };
+}
+
+export function removeWorkspaceMember(memberId: string, db = getDb()): void {
+  db.prepare('DELETE FROM workspace_members WHERE id = ?').run(memberId);
+}
+
+export function seedSimulatedDemoTreasury(db = getDb()): ConnectedWalletRecord[] {
+  const now = new Date().toISOString();
+  const demoNearWallet: ConnectedWalletRecord = {
+    id: 'WLT-SIM-NEAR-DEMO',
+    walletType: 'simulated',
+    walletId: 'simulated-near-treasury',
+    walletName: 'Simulated NEAR Corporate Treasury (DEMO)',
+    address: 'demo-treasury.steward.near',
+    network: 'NEAR Mainnet (SIMULATED DEMO)',
+    chain: 'near',
+    chainIdHex: null,
+    isSimulated: true,
+    status: 'connected',
+    nativeBalance: {
+      symbol: 'NEAR',
+      name: 'NEAR Protocol (SIMULATED)',
+      assetId: 'near:native',
+      contractAddress: null,
+      decimals: 24,
+      rawBalance: '1450000000000000000000000000',
+      formattedBalance: '1,450.0000',
+      priceUsd: 4.2,
+      priceUpdatedAt: now,
+      valueUsd: 6090.0,
+      isNative: true,
+    },
+    tokenBalances: [
+      {
+        symbol: 'USDC',
+        name: 'USD Coin on NEAR (SIMULATED)',
+        contractAddress: '17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1',
+        assetId: 'nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1',
+        decimals: 6,
+        rawBalance: '48500000000',
+        formattedBalance: '48,500.00',
+        priceUsd: 1.0,
+        priceUpdatedAt: now,
+        valueUsd: 48500.0,
+        isNative: false,
+      },
+      {
+        symbol: 'USDT',
+        name: 'Tether USD on NEAR (SIMULATED)',
+        contractAddress: 'usdt.tether-token.near',
+        assetId: 'nep141:usdt.tether-token.near',
+        decimals: 6,
+        rawBalance: '15250000000',
+        formattedBalance: '15,250.00',
+        priceUsd: 1.0,
+        priceUpdatedAt: now,
+        valueUsd: 15250.0,
+        isNative: false,
+      },
+    ],
+    capabilities: {
+      signAndSendTransaction: true,
+      signAndSendTransactions: true,
+      switchNetwork: false,
+      autoReconnect: true,
+    },
+    unsupportedCapabilities: [
+      'SIMULATED DEMO WALLET — Never broadcasts transactions to real blockchains or 1Click mainnet deposit endpoints.',
+    ],
+    lastRefreshedAt: now,
+    connectedAt: now,
+  };
+
+  const demoEvmWallet: ConnectedWalletRecord = {
+    id: 'WLT-SIM-EVM-DEMO',
+    walletType: 'simulated',
+    walletId: 'simulated-evm-treasury',
+    walletName: 'Simulated EVM Treasury Vault (DEMO)',
+    address: '0x71C000000000000000000000000000000000089A',
+    network: 'Base Mainnet (SIMULATED DEMO)',
+    chain: 'base',
+    chainIdHex: '0x2105',
+    isSimulated: true,
+    status: 'connected',
+    nativeBalance: {
+      symbol: 'ETH',
+      name: 'Ether on Base (SIMULATED)',
+      assetId: 'base:native',
+      contractAddress: null,
+      decimals: 18,
+      rawBalance: '4250000000000000000',
+      formattedBalance: '4.2500',
+      priceUsd: 2700.0,
+      priceUpdatedAt: now,
+      valueUsd: 11475.0,
+      isNative: true,
+    },
+    tokenBalances: [
+      {
+        symbol: 'USDC',
+        name: 'USD Coin on Base (SIMULATED)',
+        contractAddress: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+        assetId: '1cs_v1:base:erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
+        decimals: 6,
+        rawBalance: '32000000000',
+        formattedBalance: '32,000.00',
+        priceUsd: 1.0,
+        priceUpdatedAt: now,
+        valueUsd: 32000.0,
+        isNative: false,
+      },
+    ],
+    capabilities: {
+      signAndSendTransaction: true,
+      signAndSendTransactions: false,
+      switchNetwork: true,
+      autoReconnect: true,
+    },
+    unsupportedCapabilities: [
+      'SIMULATED DEMO WALLET — Never broadcasts transactions to real blockchains or 1Click mainnet deposit endpoints.',
+    ],
+    lastRefreshedAt: now,
+    connectedAt: now,
+  };
+
+  saveTreasuryWallet(demoNearWallet, db);
+  saveTreasuryWallet(demoEvmWallet, db);
+  updateTreasurySettings(
+    {
+      executionMode: 'simulation',
+      preferredFundingWalletAddress: demoNearWallet.address,
+      preferredSourceChain: 'near',
+      preferredSourceAsset: 'USDC',
+    },
+    db
+  );
+  updateWorkspaceProfile(
+    {
+      experienceMode: 'simulated',
+      checklistState: {
+        ...getWorkspaceProfile(db).checklistState,
+        treasuryConnected: true,
+      },
+    },
+    db
+  );
+
+  return listTreasuryWallets(db);
 }

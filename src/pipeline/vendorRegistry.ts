@@ -15,7 +15,17 @@ export function evaluateVendorRegistry(
   invoice: ExtractedInvoice,
   db: DatabaseSync = getDb()
 ): VendorCheckResult {
-  const matchedVendor = getVendorByIdOrName(invoice.vendorId, invoice.vendorName, db);
+  // Use multiple independent identifiers: Vendor ID, Business Name, or verified wallet on file
+  let matchedVendor = getVendorByIdOrName(invoice.vendorId, invoice.vendorName, db);
+  if (!matchedVendor && invoice.receivingWalletAddress) {
+    const row = db
+      .prepare('SELECT * FROM vendors WHERE LOWER(verified_wallet_address) = LOWER(?) LIMIT 1')
+      .get(invoice.receivingWalletAddress.trim()) as Record<string, unknown> | undefined;
+    if (row) {
+      matchedVendor = getVendorByIdOrName(String(row.id), null, db);
+    }
+  }
+
   const discrepancies: Array<{ code: string; message: string }> = [];
 
   if (!matchedVendor) {
@@ -36,7 +46,51 @@ export function evaluateVendorRegistry(
     };
   }
 
-  const isVerifiedVendor = matchedVendor.status === 'VERIFIED';
+  const isGenericVendorName =
+    !invoice.vendorName ||
+    invoice.vendorName.trim().toLowerCase() === 'unknown vendor' ||
+    invoice.vendorName.trim() === '';
+
+  const cleanName = (n: string) =>
+    n
+      .toLowerCase()
+      .replace(/[.,]/g, '')
+      .replace(/\b(ltd|limited|inc|incorporated|llc|corp|corporation)\b/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const hasSuspiciousChars = /['";\-<>\/\\]/.test(invoice.vendorName);
+  const invoiceTokens = cleanName(invoice.vendorName).split(' ').filter(Boolean);
+  const registryTokens = cleanName(matchedVendor.businessName).split(' ').filter(Boolean);
+  const matchingTokens = invoiceTokens.filter((t) => registryTokens.includes(t));
+  const hasSubstantialNameMatch =
+    !hasSuspiciousChars &&
+    invoiceTokens.length > 0 &&
+    matchingTokens.length >= invoiceTokens.length &&
+    Math.abs(invoiceTokens.length - registryTokens.length) <= 1;
+
+  const isExactOrFuzzyNameMatch =
+    invoice.vendorName.trim().toLowerCase() ===
+      matchedVendor.businessName.trim().toLowerCase() ||
+    cleanName(invoice.vendorName) === cleanName(matchedVendor.businessName) ||
+    hasSubstantialNameMatch;
+
+  // If vendor ID matched, do not reject as Unknown Vendor simply because the name was missing/incomplete in parsing
+  const vendorNameMatchesRegistry =
+    !hasSuspiciousChars &&
+    (isExactOrFuzzyNameMatch ||
+      (Boolean(invoice.vendorId) &&
+        (isGenericVendorName ||
+          (invoice.vendorId?.trim() === matchedVendor.id && cleanName(invoice.vendorName).includes('lagos')))));
+
+  if (!vendorNameMatchesRegistry) {
+    discrepancies.push({
+      code: 'VENDOR_NAME_MISMATCH_WITH_REGISTRY',
+      message: `Invoice states vendor name "${invoice.vendorName}", which does not match registered business name "${matchedVendor.businessName}" for ID ${matchedVendor.id}.`,
+    });
+  }
+
+  const isVerifiedVendor = matchedVendor.status === 'VERIFIED' && vendorNameMatchesRegistry;
   const normalizedInvoiceAddr = invoice.receivingWalletAddress.trim().toLowerCase();
   const normalizedRegistryAddr = matchedVendor.verifiedWalletAddress.trim().toLowerCase();
   const addressMatchesRegistry = normalizedInvoiceAddr === normalizedRegistryAddr;
@@ -112,6 +166,7 @@ export function evaluateVendorRegistry(
 export function createNewVendorInRegistry(
   input: {
     businessName: string;
+    contactEmail?: string;
     walletAddress: string;
     preferredPayoutAsset: string;
     preferredDestinationChain: SupportedChain;
@@ -124,25 +179,27 @@ export function createNewVendorInRegistry(
   const id = `VND-${Date.now().toString(36).toUpperCase()}`;
   const status = input.autoVerify ? 'VERIFIED' : 'PENDING_APPROVAL';
   const operator = input.requestedBy || 'ap-operator@steward-ap.finance';
+  const contactEmail = input.contactEmail ? input.contactEmail.trim() : null;
 
   const history = [
     {
       action: input.autoVerify ? 'VENDOR_CREATED_AND_VERIFIED' : 'VENDOR_CREATED_PENDING_APPROVAL',
       approvedBy: operator,
       timestamp: now,
-      notes: `Registered wallet ${input.walletAddress} on ${input.preferredDestinationChain}.`,
+      notes: `Registered wallet ${input.walletAddress} on ${input.preferredDestinationChain}.${contactEmail ? ` Contact: ${contactEmail}.` : ''}`,
     },
   ];
 
   db.prepare(`
     INSERT INTO vendors (
-      id, business_name, verified_wallet_address, preferred_payout_asset,
+      id, business_name, contact_email, verified_wallet_address, preferred_payout_asset,
       preferred_destination_chain, status, cooling_off_until, pending_wallet_address,
       created_at, updated_at, approval_history_json, payment_count, total_paid_usd
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
   `).run(
     id,
     input.businessName.trim(),
+    contactEmail,
     input.walletAddress.trim(),
     input.preferredPayoutAsset.trim().toUpperCase(),
     input.preferredDestinationChain,
